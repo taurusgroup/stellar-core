@@ -5,6 +5,7 @@
 #include "ledger/LedgerManagerImpl.h"
 #include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
+#include "catchup/AssumeStateWork.h"
 #include "crypto/Hex.h"
 #include "crypto/KeyUtils.h"
 #include "crypto/SHA.h"
@@ -347,10 +348,22 @@ LedgerManagerImpl::loadLastKnownLedger(function<void()> handler)
                     auto header = ltx.loadHeader();
                     if (mApp.getConfig().MODE_ENABLES_BUCKETLIST)
                     {
-                        mApp.getBucketManager().assumeState(
-                            has, header.current().ledgerVersion);
-                        CLOG_INFO(Ledger, "Assumed bucket-state for LCL: {}",
-                                  ledgerAbbrev(header.current()));
+                        auto assumeStateWork =
+                            mApp.getWorkScheduler()
+                                .executeWork<AssumeStateWork>(
+                                    has, header.current().ledgerVersion);
+                        if (assumeStateWork->getState() ==
+                            BasicWork::State::WORK_SUCCESS)
+                        {
+                            CLOG_INFO(Ledger,
+                                      "Assumed bucket-state for LCL: {}",
+                                      ledgerAbbrev(header.current()));
+                        }
+                        else
+                        {
+                            // Work should only fail during graceful shutdown
+                            releaseAssert(mApp.isStopping());
+                        }
                     }
                     advanceLedgerPointers(header.current());
                 }
@@ -560,6 +573,10 @@ uint64_t
 LedgerManagerImpl::secondsSinceLastLedgerClose() const
 {
     uint64_t ct = getLastClosedLedgerHeader().header.scpValue.closeTime;
+    if (ct == 0)
+    {
+        return 0;
+    }
     uint64_t now = mApp.timeNow();
     return (now > ct) ? (now - ct) : 0;
 }

@@ -19,6 +19,7 @@
 #include "util/XDROperators.h"
 #include "util/types.h"
 
+#include "overlay/OverlayManager.h"
 #include "util/UnorderedSet.h"
 #include <fmt/chrono.h>
 #include <fmt/format.h>
@@ -53,7 +54,8 @@ static const std::unordered_set<std::string> TESTING_ONLY_OPTIONS = {
     "LOADGEN_OP_COUNT_DISTRIBUTION_FOR_TESTING",
     "CATCHUP_WAIT_MERGES_TX_APPLY_FOR_TESTING",
     "ARTIFICIALLY_DELAY_BUCKET_APPLICATION_FOR_TESTING",
-    "ARTIFICIALLY_SLEEP_MAIN_THREAD_FOR_TESTING"};
+    "ARTIFICIALLY_SLEEP_MAIN_THREAD_FOR_TESTING",
+    "ARTIFICIALLY_SKIP_CONNECTION_ADJUSTMENT_FOR_TESTING"};
 
 // Options that should only be used for testing
 static const std::unordered_set<std::string> TESTING_SUGGESTED_OPTIONS = {
@@ -127,8 +129,8 @@ Config::Config() : NODE_SEED(SecretKey::random())
 
     MAXIMUM_LEDGER_CLOSETIME_DRIFT = 50;
 
-    OVERLAY_PROTOCOL_MIN_VERSION = 23;
-    OVERLAY_PROTOCOL_VERSION = 25;
+    OVERLAY_PROTOCOL_MIN_VERSION = 24;
+    OVERLAY_PROTOCOL_VERSION = 27;
 
     VERSION_STR = STELLAR_CORE_VERSION;
 
@@ -138,6 +140,9 @@ Config::Config() : NODE_SEED(SecretKey::random())
     CATCHUP_COMPLETE = false;
     CATCHUP_RECENT = 0;
     EXPERIMENTAL_PRECAUTION_DELAY_META = false;
+    EXPERIMENTAL_BUCKETLIST_DB = false;
+    EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT = 14; // 2^14 == 16 kb
+    EXPERIMENTAL_BUCKETLIST_DB_INDEX_CUTOFF = 20;             // 20 mb
     // automatic maintenance settings:
     // short and prime with 1 hour which will cause automatic maintenance to
     // rarely conflict with any other scheduled tasks on a machine (that tend to
@@ -155,6 +160,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
     ARTIFICIALLY_SET_CLOSE_TIME_FOR_TESTING = 0;
     ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = false;
     ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING = false;
+    ARTIFICIALLY_SKIP_CONNECTION_ADJUSTMENT_FOR_TESTING = false;
     ARTIFICIALLY_REPLAY_WITH_NEWEST_BUCKET_LOGIC_FOR_TESTING = false;
     ARTIFICIALLY_DELAY_BUCKET_APPLICATION_FOR_TESTING =
         std::chrono::seconds::zero();
@@ -200,7 +206,6 @@ Config::Config() : NODE_SEED(SecretKey::random())
     FLOOD_DEMAND_PERIOD_MS = std::chrono::milliseconds(200);
     FLOOD_ADVERT_PERIOD_MS = std::chrono::milliseconds(100);
     FLOOD_DEMAND_BACKOFF_DELAY_MS = std::chrono::milliseconds(500);
-    ENABLE_PULL_MODE = true;
 
     MAX_BATCH_WRITE_COUNT = 1024;
     MAX_BATCH_WRITE_BYTES = 1 * 1024 * 1024;
@@ -233,6 +238,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
 
     HALT_ON_INTERNAL_TRANSACTION_ERROR = false;
 
+    MAX_DEX_TX_OPERATIONS_IN_TX_SET = std::nullopt;
 #ifdef BUILD_TESTS
     TEST_CASES_ENABLED = false;
 #endif
@@ -972,6 +978,20 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
             {
                 EXPERIMENTAL_PRECAUTION_DELAY_META = readBool(item);
             }
+            else if (item.first == "EXPERIMENTAL_BUCKETLIST_DB")
+            {
+                EXPERIMENTAL_BUCKETLIST_DB = readBool(item);
+            }
+            else if (item.first ==
+                     "EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT")
+            {
+                EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT =
+                    readInt<size_t>(item);
+            }
+            else if (item.first == "EXPERIMENTAL_BUCKETLIST_DB_INDEX_CUTOFF")
+            {
+                EXPERIMENTAL_BUCKETLIST_DB_INDEX_CUTOFF = readInt<size_t>(item);
+            }
             else if (item.first == "METADATA_DEBUG_LEDGERS")
             {
                 METADATA_DEBUG_LEDGERS = readInt<uint32_t>(item);
@@ -1149,10 +1169,6 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
             {
                 FLOOD_DEMAND_BACKOFF_DELAY_MS =
                     std::chrono::milliseconds(readInt<int>(item, 1));
-            }
-            else if (item.first == "ENABLE_PULL_MODE")
-            {
-                ENABLE_PULL_MODE = readBool(item);
             }
             else if (item.first == "FLOOD_ARB_TX_BASE_ALLOWANCE")
             {
@@ -1354,6 +1370,19 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
             {
                 FLOW_CONTROL_SEND_MORE_BATCH_SIZE = readInt<uint32_t>(item, 1);
             }
+            else if (item.first == "MAX_DEX_TX_OPERATIONS_IN_TX_SET")
+            {
+                auto value = readInt<uint32_t>(item);
+                if (value > 0 && value < MAX_OPS_PER_TX + 2)
+                {
+                    throw std::invalid_argument(fmt::format(
+                        "MAX_DEX_TX_OPERATIONS_IN_TX_SET must be either 0 or "
+                        "at least {} in order to not drop any transactions.",
+                        MAX_OPS_PER_TX + 2));
+                }
+                MAX_DEX_TX_OPERATIONS_IN_TX_SET =
+                    value == 0 ? std::nullopt : std::make_optional(value);
+            }
             else
             {
                 std::string err("Unknown configuration entry: '");
@@ -1479,6 +1508,24 @@ Config::adjust()
         }
     }
 
+    // Ensure outbound connections are capped based on inbound rate
+    int limit =
+        MAX_ADDITIONAL_PEER_CONNECTIONS / OverlayManager::MIN_INBOUND_FACTOR +
+        OverlayManager::MIN_INBOUND_FACTOR;
+    if (static_cast<int>(TARGET_PEER_CONNECTIONS) > limit)
+    {
+        TARGET_PEER_CONNECTIONS = limit;
+        LOG_WARNING(DEFAULT_LOG,
+                    "Adjusted TARGET_PEER_CONNECTIONS to {} due to "
+                    "insufficient MAX_ADDITIONAL_PEER_CONNECTIONS={}",
+                    limit, MAX_ADDITIONAL_PEER_CONNECTIONS);
+    }
+
+    auto const originalMaxAdditionalPeerConnections =
+        MAX_ADDITIONAL_PEER_CONNECTIONS;
+    auto const originalTargetPeerConnections = TARGET_PEER_CONNECTIONS;
+    auto const originalMaxPendingConnections = MAX_PENDING_CONNECTIONS;
+
     int maxFsConnections = std::min<int>(
         std::numeric_limits<unsigned short>::max(), fs::getMaxConnections());
 
@@ -1560,6 +1607,23 @@ Config::adjust()
         MAX_OUTBOUND_PENDING_CONNECTIONS = 0;
         MAX_INBOUND_PENDING_CONNECTIONS = 0;
     }
+    auto warnIfChanged = [&](std::string const name, auto const originalValue,
+                             auto const newValue) {
+        if (originalValue != newValue)
+        {
+            LOG_WARNING(DEFAULT_LOG,
+                        "Adjusted {} from {} to {} due to OS limits (the "
+                        "maximum number of file descriptors)",
+                        name, originalValue, newValue);
+        }
+    };
+    warnIfChanged("MAX_ADDITIONAL_PEER_CONNECTIONS",
+                  originalMaxAdditionalPeerConnections,
+                  MAX_ADDITIONAL_PEER_CONNECTIONS);
+    warnIfChanged("TARGET_PEER_CONNECTIONS", originalTargetPeerConnections,
+                  TARGET_PEER_CONNECTIONS);
+    warnIfChanged("MAX_PENDING_CONNECTIONS", originalMaxPendingConnections,
+                  MAX_PENDING_CONNECTIONS);
 }
 
 void
@@ -1866,6 +1930,13 @@ bool
 Config::isInMemoryMode() const
 {
     return MODE_USES_IN_MEMORY_LEDGER;
+}
+
+bool
+Config::isUsingBucketListDB() const
+{
+    return EXPERIMENTAL_BUCKETLIST_DB && !MODE_USES_IN_MEMORY_LEDGER &&
+           MODE_ENABLES_BUCKETLIST;
 }
 
 bool

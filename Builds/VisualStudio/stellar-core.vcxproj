@@ -435,6 +435,7 @@ exit /b 0
     <ClCompile Include="..\..\lib\util\siphash.cpp" />
     <ClCompile Include="..\..\src\bucket\Bucket.cpp" />
     <ClCompile Include="..\..\src\bucket\BucketApplicator.cpp" />
+    <ClCompile Include="..\..\src\bucket\BucketIndex.cpp" />
     <ClCompile Include="..\..\src\bucket\BucketInputIterator.cpp" />
     <ClCompile Include="..\..\src\bucket\BucketList.cpp" />
     <ClCompile Include="..\..\src\bucket\BucketManagerImpl.cpp" />
@@ -443,18 +444,22 @@ exit /b 0
     <ClCompile Include="..\..\src\bucket\FutureBucket.cpp" />
     <ClCompile Include="..\..\src\bucket\MergeKey.cpp" />
     <ClCompile Include="..\..\src\bucket\PublishQueueBuckets.cpp" />
+    <ClCompile Include="..\..\src\bucket\test\BucketIndexTests.cpp" />
     <ClCompile Include="..\..\src\bucket\test\BucketListTests.cpp" />
     <ClCompile Include="..\..\src\bucket\test\BucketManagerTests.cpp" />
     <ClCompile Include="..\..\src\bucket\test\BucketMergeMapTests.cpp" />
     <ClCompile Include="..\..\src\bucket\test\BucketTests.cpp" />
+    <ClCompile Include="..\..\src\bucket\test\BucketTestUtils.cpp" />
     <ClCompile Include="..\..\src\catchup\ApplyBucketsWork.cpp" />
     <ClCompile Include="..\..\src\catchup\ApplyBufferedLedgersWork.cpp" />
     <ClCompile Include="..\..\src\catchup\ApplyCheckpointWork.cpp" />
     <ClCompile Include="..\..\src\catchup\ApplyLedgerWork.cpp" />
+    <ClCompile Include="..\..\src\catchup\AssumeStateWork.cpp" />
     <ClCompile Include="..\..\src\catchup\CatchupConfiguration.cpp" />
     <ClCompile Include="..\..\src\catchup\CatchupManagerImpl.cpp" />
     <ClCompile Include="..\..\src\catchup\CatchupRange.cpp" />
     <ClCompile Include="..\..\src\catchup\CatchupWork.cpp" />
+    <ClCompile Include="..\..\src\catchup\IndexBucketsWork.cpp" />
     <ClCompile Include="..\..\src\catchup\simulation\HistoryArchiveStream.cpp" />
     <ClCompile Include="..\..\src\catchup\simulation\TxSimApplyTransactionsWork.cpp" />
     <ClCompile Include="..\..\src\catchup\test\CatchupWorkTests.cpp" />
@@ -509,6 +514,7 @@ exit /b 0
     <ClCompile Include="..\..\src\ledger\InternalLedgerEntry.cpp" />
     <ClCompile Include="..\..\src\ledger\LedgerCloseMetaFrame.cpp" />
     <ClCompile Include="..\..\src\ledger\LedgerTxnClaimableBalanceSQL.cpp" />
+    <ClCompile Include="..\..\src\ledger\LedgerTxnContractCodeSQL.cpp" />
     <ClCompile Include="..\..\src\ledger\LedgerTxnLiquidityPoolSQL.cpp" />
     <ClCompile Include="..\..\src\ledger\LedgerTxnConfigSettingSQL.cpp" />
     <ClCompile Include="..\..\src\ledger\LedgerTxnContractDataSQL.cpp" />
@@ -750,6 +756,7 @@ exit /b 0
     <ClCompile Include="..\..\src\overlay\test\LoopbackPeer.cpp" />
     <ClCompile Include="..\..\src\overlay\test\OverlayManagerTests.cpp" />
     <ClCompile Include="..\..\src\overlay\test\OverlayTests.cpp" />
+    <ClCompile Include="..\..\src\overlay\test\OverlayTestUtils.cpp" />
     <ClCompile Include="..\..\src\overlay\test\PeerManagerTests.cpp" />
     <ClCompile Include="..\..\src\overlay\test\TCPPeerTests.cpp" />
     <ClCompile Include="..\..\src\overlay\test\TrackerTests.cpp" />
@@ -855,17 +862,23 @@ exit /b 0
     <ClCompile Include="..\..\src\work\WorkScheduler.cpp" />
     <ClCompile Include="..\..\src\work\WorkSequence.cpp" />
     <ClCompile Include="..\..\src\work\WorkWithCallback.cpp" />
-    <ClCompile Include="src\$(Configuration)\generated\rust\RustBridge.cpp" />
+    <ClCompile Include="src\$(Configuration)\generated\rust\RustBridge.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='DebugCurrV|x64'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='ReleaseCurrV|x64'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="src\$(Configuration)\generated\xdr\XDRFilesSha256.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\..\lib\bloom_filter.hpp" />
     <ClInclude Include="..\..\lib\catch.hpp" />
+    <ClInclude Include="..\..\lib\clara.hpp" />
     <ClInclude Include="..\..\lib\util\finally.h" />
     <ClInclude Include="..\..\lib\fmt\include\fmt\format.h" />
     <ClInclude Include="..\..\lib\util\siphash.h" />
     <ClInclude Include="..\..\lib\util\stdrandom.h" />
     <ClInclude Include="..\..\src\bucket\Bucket.h" />
     <ClInclude Include="..\..\src\bucket\BucketApplicator.h" />
+    <ClInclude Include="..\..\src\bucket\BucketIndex.h" />
     <ClInclude Include="..\..\src\bucket\BucketInputIterator.h" />
     <ClInclude Include="..\..\src\bucket\BucketList.h" />
     <ClInclude Include="..\..\src\bucket\BucketManager.h" />
@@ -877,16 +890,19 @@ exit /b 0
     <ClInclude Include="..\..\src\bucket\LedgerCmp.h" />
     <ClInclude Include="..\..\src\bucket\MergeKey.h" />
     <ClInclude Include="..\..\src\bucket\PublishQueueBuckets.h" />
+    <ClInclude Include="..\..\src\bucket\test\BucketTestUtils.h" />
     <ClInclude Include="..\..\src\catchup\ApplyBucketsWork.h" />
     <ClInclude Include="..\..\src\catchup\ApplyBufferedLedgersWork.h" />
     <ClInclude Include="..\..\src\catchup\ApplyCheckpointWork.h" />
     <ClInclude Include="..\..\src\catchup\ApplyLedgerWork.h" />
+    <ClInclude Include="..\..\src\catchup\AssumeStateWork.h" />
     <ClInclude Include="..\..\src\catchup\CatchupConfiguration.h" />
     <ClInclude Include="..\..\src\catchup\CatchupManager.h" />
     <ClInclude Include="..\..\src\catchup\CatchupManagerImpl.h" />
     <ClInclude Include="..\..\src\catchup\CatchupRange.h" />
     <ClInclude Include="..\..\src\catchup\CatchupWork.h" />
     <ClInclude Include="..\..\src\catchup\DownloadApplyTxsWork.h" />
+    <ClInclude Include="..\..\src\catchup\IndexBucketsWork.h" />
     <ClInclude Include="..\..\src\catchup\simulation\HistoryArchiveStream.h" />
     <ClInclude Include="..\..\src\catchup\simulation\TxSimApplyTransactionsWork.h" />
     <ClInclude Include="..\..\src\catchup\test\CatchupWorkTests.h" />
@@ -1092,6 +1108,7 @@ exit /b 0
     <ClInclude Include="..\..\src\overlay\test\LoopbackPeer.h" />
     <ClInclude Include="..\..\src\overlay\Tracker.h" />
     <ClInclude Include="..\..\src\overlay\TxAdvertQueue.h" />
+    <ClInclude Include="..\..\src\overlay\test\TxAdvertQueue.h" />
     <ClInclude Include="..\..\src\process\ProcessManager.h" />
     <ClInclude Include="..\..\src\process\ProcessManagerImpl.h" />
     <ClInclude Include="..\..\src\rust\CppShims.h" />

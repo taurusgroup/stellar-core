@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "herder/TransactionQueue.h"
+#include "crypto/Hex.h"
 #include "crypto/SecretKey.h"
 #include "herder/SurgePricingUtils.h"
 #include "herder/TxQueueLimiter.h"
@@ -66,8 +67,8 @@ TransactionQueue::TransactionQueue(Application& app, uint32 pendingDepth,
           app.getMetrics().NewTimer({"herder", "pending-txs", "self-delay"}))
     , mBroadcastTimer(app)
 {
-    mTxQueueLimiter = std::make_unique<TxQueueLimiter>(poolLedgerMultiplier,
-                                                       app.getLedgerManager());
+    mTxQueueLimiter =
+        std::make_unique<TxQueueLimiter>(poolLedgerMultiplier, app);
     for (uint32 i = 0; i < pendingDepth; i++)
     {
         mSizeByAge.emplace_back(&app.getMetrics().NewCounter(
@@ -79,6 +80,7 @@ TransactionQueue::TransactionQueue(Application& app, uint32 pendingDepth,
     mFilteredTypes.insert(filteredTypes.begin(), filteredTypes.end());
     mBroadcastSeed =
         rand_uniform<uint64>(0, std::numeric_limits<uint64>::max());
+    mBroadcastOpCarryover.resize(1);
 }
 
 TransactionQueue::~TransactionQueue()
@@ -192,7 +194,7 @@ TransactionQueue::AddResult
 TransactionQueue::canAdd(TransactionFrameBasePtr tx,
                          AccountStates::iterator& stateIter,
                          TimestampedTransactions::iterator& oldTxIter,
-                         std::vector<TxStackPtr>& txsToEvict)
+                         std::vector<std::pair<TxStackPtr, bool>>& txsToEvict)
 {
     ZoneScoped;
     if (isBanned(tx->getFullHash()))
@@ -369,6 +371,8 @@ TransactionQueue::prepareDropTransaction(AccountState& as, TimestampedTx& tstx)
     as.mQueueSizeOps -= ops;
     mTxQueueLimiter->removeTransaction(tstx.mTx);
     mKnownTxHashes.erase(tstx.mTx->getFullHash());
+    CLOG_DEBUG(Tx, "Dropping {} transaction",
+               hexAbbrev(tstx.mTx->getFullHash()));
     if (!tstx.mBroadcasted)
     {
         as.mBroadcastQueueOps -= ops;
@@ -491,7 +495,7 @@ TransactionQueue::tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf)
     ZoneScoped;
     AccountStates::iterator stateIter;
     TimestampedTransactions::iterator oldTxIter;
-    std::vector<TxStackPtr> txsToEvict;
+    std::vector<std::pair<TxStackPtr, bool>> txsToEvict;
     auto const res = canAdd(tx, stateIter, oldTxIter, txsToEvict);
     if (res != TransactionQueue::AddResult::ADD_STATUS_PENDING)
     {
@@ -526,7 +530,7 @@ TransactionQueue::tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf)
     // make space so that we can add this transaction
     // this will succeed as `canAdd` ensures that this is the case
     mTxQueueLimiter->evictTransactions(
-        txsToEvict, ops,
+        txsToEvict, *tx,
         [&](TransactionFrameBasePtr const& txToEvict) { ban({txToEvict}); });
     mTxQueueLimiter->addTransaction(tx);
     mKnownTxHashes[tx->getFullHash()] = tx;
@@ -658,6 +662,8 @@ TransactionQueue::removeApplied(Transactions const& appliedTxs)
     {
         auto& bannedFront = mBannedTransactions.front();
         bannedFront.emplace(h);
+        CLOG_DEBUG(Tx, "Ban applied transaction {}", hexAbbrev(h));
+
         // do not mark metric for banning as this is the result of normal flow
         // of operations
     }
@@ -690,6 +696,7 @@ TransactionQueue::ban(Transactions const& banTxs)
     {
         auto& transactions = transactionsByAccount[tx->getSourceID()];
         transactions.emplace_back(tx);
+        CLOG_DEBUG(Tx, "Ban transaction {}", hexAbbrev(tx->getFullHash()));
         if (bannedFront.emplace(tx->getFullHash()).second)
         {
             mBannedTransactionsCounter.inc();
@@ -799,6 +806,8 @@ TransactionQueue::shift()
                 //     !it->second.mTransactions.empty()
                 // otherwise we couldn't have reached this line.
                 prepareDropTransaction(it->second, toBan);
+                CLOG_DEBUG(Tx, "Ban transaction {}",
+                           hexAbbrev(toBan.mTx->getFullHash()));
                 bannedFront.insert(toBan.mTx->getFullHash());
             }
             mBannedTransactionsCounter.inc(
@@ -917,7 +926,7 @@ TransactionQueue::maybeVersionUpgraded()
     mLedgerVersion = lcl.header.ledgerVersion;
 }
 
-uint32_t
+std::pair<uint32_t, std::optional<uint32_t>>
 TransactionQueue::getMaxOpsToFloodThisPeriod() const
 {
     auto& cfg = mApp.getConfig();
@@ -930,13 +939,31 @@ TransactionQueue::getMaxOpsToFloodThisPeriod() const
     int64_t opsToFloodLedger = static_cast<int64_t>(opsToFloodLedgerDbl);
 
     int64_t opsToFlood =
-        mBroadcastOpCarryover +
+        mBroadcastOpCarryover[SurgePricingPriorityQueue::GENERIC_LANE] +
         bigDivideOrThrow(opsToFloodLedger, cfg.FLOOD_TX_PERIOD_MS,
                          cfg.getExpectedLedgerCloseTime().count() * 1000,
                          Rounding::ROUND_UP);
     releaseAssertOrThrow(opsToFlood >= 0 &&
                          opsToFlood <= std::numeric_limits<uint32_t>::max());
-    return static_cast<uint32_t>(opsToFlood);
+
+    auto maxDexOps = cfg.MAX_DEX_TX_OPERATIONS_IN_TX_SET;
+    std::optional<uint32_t> dexOpsToFlood;
+    if (maxDexOps)
+    {
+        *maxDexOps = std::min(maxOps, *maxDexOps);
+        uint32_t dexOpsToFloodLedger =
+            static_cast<uint32_t>(*maxDexOps * opRatePerLedger);
+        uint32_t dexOpsCarryover =
+            mBroadcastOpCarryover.size() > DexLimitingLaneConfig::DEX_LANE
+                ? mBroadcastOpCarryover[DexLimitingLaneConfig::DEX_LANE]
+                : 0;
+        dexOpsToFlood =
+            dexOpsCarryover +
+            bigDivideOrThrow(dexOpsToFloodLedger, cfg.FLOOD_TX_PERIOD_MS,
+                             cfg.getExpectedLedgerCloseTime().count() * 1000,
+                             Rounding::ROUND_UP);
+    }
+    return std::make_pair(static_cast<uint32_t>(opsToFlood), dexOpsToFlood);
 }
 
 TransactionQueue::BroadcastStatus
@@ -1111,7 +1138,7 @@ TransactionQueue::broadcastSome()
     // highest base fee not broadcasted so far.
     // This broadcasts from account queues in order as to maximize chances of
     // propagation.
-    auto opsToFlood = getMaxOpsToFloodThisPeriod();
+    auto [opsToFlood, dexOpsToFlood] = getMaxOpsToFloodThisPeriod();
 
     size_t totalOpsToFlood = 0;
     std::vector<TxStackPtr> trackersToBroadcast;
@@ -1156,14 +1183,18 @@ TransactionQueue::broadcastSome()
             return SurgePricingPriorityQueue::VisitTxStackResult::TX_SKIPPED;
         }
     };
-    SurgePricingPriorityQueue::visitTopTxs(trackersToBroadcast, opsToFlood,
-                                           mBroadcastSeed, visitor,
-                                           mBroadcastOpCarryover);
+    SurgePricingPriorityQueue::visitTopTxs(
+        trackersToBroadcast,
+        std::make_shared<DexLimitingLaneConfig>(opsToFlood, dexOpsToFlood),
+        mBroadcastSeed, visitor, mBroadcastOpCarryover);
     ban(banningTxs);
     // carry over remainder, up to MAX_OPS_PER_TX ops
     // reason is that if we add 1 next round, we can flood a "worst case fee
     // bump" tx
-    mBroadcastOpCarryover = std::min(mBroadcastOpCarryover, MAX_OPS_PER_TX + 1);
+    for (auto& opsLeft : mBroadcastOpCarryover)
+    {
+        opsLeft = std::min(opsLeft, MAX_OPS_PER_TX + 1);
+    }
     return totalOpsToFlood != 0;
 }
 

@@ -103,7 +103,7 @@ class OverlayManagerImpl : public OverlayManager
     {
         VirtualClock::time_point firstDemanded;
         VirtualClock::time_point lastDemanded;
-        UnorderedSet<NodeID> peers;
+        UnorderedMap<NodeID, VirtualClock::time_point> peers;
         bool latencyRecorded{false};
     };
     UnorderedMap<Hash, DemandHistory> mDemandHistoryMap;
@@ -156,7 +156,6 @@ class OverlayManagerImpl : public OverlayManager
     getOutboundAuthenticatedPeers() const override;
     std::map<NodeID, Peer::pointer> getAuthenticatedPeers() const override;
     int getAuthenticatedPeersCount() const override;
-    int64_t getPullModePercentage() const override;
 
     // returns nullptr if the passed peer isn't found
     Peer::pointer getConnectedPeer(PeerBareAddress const& address) override;
@@ -182,7 +181,8 @@ class OverlayManagerImpl : public OverlayManager
     void recordMessageMetric(StellarMessage const& stellarMsg,
                              Peer::pointer peer) override;
 
-    void recordTxPullLatency(Hash const& hash) override;
+    void recordTxPullLatency(Hash const& hash,
+                             std::shared_ptr<Peer> peer) override;
     size_t getMaxAdvertSize() const override;
 
   private:

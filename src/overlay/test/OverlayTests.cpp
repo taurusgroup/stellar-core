@@ -12,6 +12,7 @@
 #include "overlay/PeerManager.h"
 #include "overlay/TCPPeer.h"
 #include "overlay/test/LoopbackPeer.h"
+#include "overlay/test/OverlayTestUtils.h"
 #include "simulation/Simulation.h"
 #include "simulation/Topologies.h"
 #include "test/TestUtils.h"
@@ -136,21 +137,19 @@ TEST_CASE("loopback peer flow control activation", "[overlay][flowcontrol]")
     auto cfg2 = getTestConfig(1);
 
     auto runTest = [&](std::vector<Config> expectedCfgs,
-                       Peer::FlowControlState expectedState,
-                       bool sendIllegalSendMore = false) {
-        REQUIRE(expectedState != Peer::FlowControlState::DONT_KNOW);
+                       bool expectAuthenticated, bool sendIllegalSendMore) {
         auto app1 = createTestApplication(clock, expectedCfgs[0]);
         auto app2 = createTestApplication(clock, expectedCfgs[1]);
 
         LoopbackPeerConnection conn(*app1, *app2);
         testutil::crankSome(clock);
 
-        if (expectedState == Peer::FlowControlState::ENABLED)
+        auto const dropReason = "unexpected SEND_MORE message";
+
+        if (expectAuthenticated)
         {
             REQUIRE(conn.getInitiator()->isAuthenticated());
             REQUIRE(conn.getAcceptor()->isAuthenticated());
-            REQUIRE(conn.getInitiator()->flowControlEnabled() == expectedState);
-            REQUIRE(conn.getAcceptor()->flowControlEnabled() == expectedState);
             REQUIRE(conn.getInitiator()->checkCapacity(
                 cfg2.PEER_FLOOD_READING_CAPACITY));
             REQUIRE(conn.getAcceptor()->checkCapacity(
@@ -164,17 +163,11 @@ TEST_CASE("loopback peer flow control activation", "[overlay][flowcontrol]")
                 testutil::crankSome(clock);
                 REQUIRE(!conn.getInitiator()->isConnected());
                 REQUIRE(!conn.getAcceptor()->isConnected());
-                REQUIRE(conn.getAcceptor()->getDropReason() ==
-                        "unexpected SEND_MORE message");
+                REQUIRE(conn.getAcceptor()->getDropReason() == dropReason);
             }
         }
         else
         {
-            auto dropReason =
-                cfg2.OVERLAY_PROTOCOL_VERSION <
-                        Peer::FIRST_VERSION_SUPPORTING_FLOW_CONTROL
-                    ? "wrong protocol version"
-                    : "must enable flow control";
             REQUIRE(!conn.getInitiator()->isConnected());
             REQUIRE(!conn.getAcceptor()->isConnected());
             REQUIRE(conn.getAcceptor()->getDropReason() == dropReason);
@@ -189,12 +182,12 @@ TEST_CASE("loopback peer flow control activation", "[overlay][flowcontrol]")
         SECTION("basic")
         {
             // Successfully enabled flow control
-            runTest({cfg1, cfg2}, Peer::FlowControlState::ENABLED, false);
+            runTest({cfg1, cfg2}, true, false);
         }
         SECTION("bad peer")
         {
             // Try to disable flow control after enabling
-            runTest({cfg1, cfg2}, Peer::FlowControlState::ENABLED, true);
+            runTest({cfg1, cfg2}, true, true);
         }
     }
     SECTION("one disables")
@@ -202,14 +195,7 @@ TEST_CASE("loopback peer flow control activation", "[overlay][flowcontrol]")
         // Peer tries to disable flow control during auth
         // Set capacity to 0 so that the peer sends SEND_MORE with numMessages=0
         cfg2.PEER_FLOOD_READING_CAPACITY = 0;
-        runTest({cfg1, cfg2}, Peer::FlowControlState::DISABLED);
-    }
-    SECTION("one does not support")
-    {
-        // Peer is not on minimum supported version
-        cfg2.OVERLAY_PROTOCOL_VERSION =
-            Peer::FIRST_VERSION_SUPPORTING_FLOW_CONTROL - 1;
-        runTest({cfg1, cfg2}, Peer::FlowControlState::DISABLED);
+        runTest({cfg1, cfg2}, false, false);
     }
 }
 
@@ -233,11 +219,6 @@ TEST_CASE("drop peers that dont respect capacity", "[overlay][flowcontrol]")
     testutil::crankSome(clock);
     REQUIRE(conn.getInitiator()->isAuthenticated());
     REQUIRE(conn.getAcceptor()->isAuthenticated());
-
-    REQUIRE(conn.getInitiator()->flowControlEnabled() ==
-            Peer::FlowControlState::ENABLED);
-    REQUIRE(conn.getAcceptor()->flowControlEnabled() ==
-            Peer::FlowControlState::ENABLED);
 
     // tx is invalid, but it doesn't matter
     StellarMessage msg;
@@ -275,11 +256,6 @@ TEST_CASE("drop idle flow-controlled peers", "[overlay][flowcontrol]")
     REQUIRE(conn.getInitiator()->isAuthenticated());
     REQUIRE(conn.getAcceptor()->isAuthenticated());
 
-    REQUIRE(conn.getInitiator()->flowControlEnabled() ==
-            Peer::FlowControlState::ENABLED);
-    REQUIRE(conn.getAcceptor()->flowControlEnabled() ==
-            Peer::FlowControlState::ENABLED);
-
     StellarMessage msg;
     msg.type(TRANSACTION);
     REQUIRE(conn.getAcceptor()->getOutboundCapacity() == 1);
@@ -313,11 +289,6 @@ TEST_CASE("drop peers that overflow capacity", "[overlay][flowcontrol]")
     testutil::crankSome(clock);
     REQUIRE(conn.getInitiator()->isAuthenticated());
     REQUIRE(conn.getAcceptor()->isAuthenticated());
-
-    REQUIRE(conn.getInitiator()->flowControlEnabled() ==
-            Peer::FlowControlState::ENABLED);
-    REQUIRE(conn.getAcceptor()->flowControlEnabled() ==
-            Peer::FlowControlState::ENABLED);
 
     // Set outbound capacity close to max on initiator
     auto& cap = conn.getInitiator()->getOutboundCapacity();
@@ -353,6 +324,56 @@ TEST_CASE("failed auth", "[overlay][connections]")
 
     REQUIRE(knowsAsOutbound(*app1, *app2));
     REQUIRE(knowsAsInbound(*app2, *app1));
+
+    testutil::shutdownWorkScheduler(*app2);
+    testutil::shutdownWorkScheduler(*app1);
+}
+
+TEST_CASE("pull mode compatibility older overlay version",
+          "[overlay][connections][pullmode]")
+{
+    // Node 0 has the latest overlay version. Node 1 has an old overlay version
+    // and enables/disables pull mode. Node 0 refuses to connect if disabled.
+    // Note: This test will become obsolete once the min overlay version becomes
+    // 27 (=FIRST_VERSION_REQUIRING_PULL_MODE).
+    // Node 0 will drop Node 1 due to an incompatible overlay version not
+    // because of the pull mode flag.
+
+    VirtualClock clock;
+    Config const& cfg1 = getTestConfig(0);
+    Config cfg2 = getTestConfig(1);
+    cfg2.OVERLAY_PROTOCOL_VERSION = Peer::FIRST_VERSION_REQUIRING_PULL_MODE - 1;
+    auto app1 = createTestApplication(clock, cfg1);
+    auto app2 = createTestApplication(clock, cfg2);
+
+    LoopbackPeerConnection conn(*app1, *app2);
+    SECTION("older version intending to enable pull mode")
+    {
+        // This is perfectly valid as long as the overlay version is acceptable.
+        // The peer's version indicates that the operator has the option to
+        // disable pull mode, but the operator intends to turn on pull mode.
+        testutil::crankSome(clock);
+
+        REQUIRE(conn.getInitiator()->isConnected());
+        REQUIRE(conn.getAcceptor()->isConnected());
+
+        REQUIRE(knowsAsOutbound(*app1, *app2));
+        REQUIRE(knowsAsInbound(*app2, *app1));
+    }
+    SECTION("older version intending to disable pull mode")
+    {
+        // The operator intends to turn off pull mode.
+        // The latest version refuses to connect to such a peer.
+        conn.getAcceptor()->overrideDisablePullModeForTesting();
+        testutil::crankSome(clock);
+
+        REQUIRE(!conn.getInitiator()->isConnected());
+        REQUIRE(!conn.getAcceptor()->isConnected());
+        REQUIRE(conn.getAcceptor()->getDropReason() == "pull mode must be on");
+
+        REQUIRE(knowsAsOutbound(*app1, *app2));
+        REQUIRE(knowsAsInbound(*app2, *app1));
+    }
 
     testutil::shutdownWorkScheduler(*app2);
     testutil::shutdownWorkScheduler(*app1);
@@ -1677,17 +1698,6 @@ TEST_CASE("overlay flow control", "[overlay][flowcontrol]")
                 3 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false),
             std::runtime_error);
     }
-    SECTION("one peer doesn't support flow control")
-    {
-        configs[2].OVERLAY_PROTOCOL_VERSION =
-            Peer::FIRST_VERSION_SUPPORTING_FLOW_CONTROL - 1;
-        setupSimulation();
-        REQUIRE_THROWS_AS(
-            simulation->crankUntil(
-                [&] { return simulation->haveAllExternalized(2, 1); },
-                3 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false),
-            std::runtime_error);
-    }
 }
 
 PeerBareAddress
@@ -1868,30 +1878,6 @@ TEST_CASE("generalized tx sets are not sent to non-upgraded peers",
     }
 }
 
-auto numDemandSent = [](std::shared_ptr<Application> app) {
-    return app->getOverlayManager()
-        .getOverlayMetrics()
-        .mSendFloodDemandMeter.count();
-};
-
-auto numUnknownDemand = [](std::shared_ptr<Application> app) {
-    return app->getMetrics()
-        .NewMeter({"overlay", "flood", "unfulfilled-unknown"}, "message")
-        .count();
-};
-
-auto numTxHashesAdvertised = [](std::shared_ptr<Application> app) {
-    return app->getMetrics()
-        .NewMeter({"overlay", "flood", "advertised"}, "message")
-        .count();
-};
-
-auto numFulfilled = [](std::shared_ptr<Application> app) {
-    return app->getMetrics()
-        .NewMeter({"overlay", "flood", "fulfilled"}, "message")
-        .count();
-};
-
 TEST_CASE("overlay pull mode", "[overlay][pullmode]")
 {
     VirtualClock clock;
@@ -1904,7 +1890,6 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
         Config cfg = getTestConfig(i);
         cfg.FLOOD_DEMAND_BACKOFF_DELAY_MS = std::chrono::milliseconds(200);
         cfg.FLOOD_DEMAND_PERIOD_MS = std::chrono::milliseconds(200);
-        cfg.ENABLE_PULL_MODE = true;
         // Using a small tx set size such as 50 may lead to an unexpectedly
         // small advert/demand size limit.
         cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 1000;
@@ -1922,10 +1907,6 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
     {
         REQUIRE(conn->getInitiator()->isAuthenticated());
         REQUIRE(conn->getAcceptor()->isAuthenticated());
-        REQUIRE(conn->getInitiator()->flowControlEnabled() ==
-                Peer::FlowControlState::ENABLED);
-        REQUIRE(conn->getAcceptor()->flowControlEnabled() ==
-                Peer::FlowControlState::ENABLED);
     }
 
     auto createTxn = [](auto n) {
@@ -1981,8 +1962,8 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
         testutil::crankFor(
             clock, 3 * apps[2]->getConfig().FLOOD_DEMAND_PERIOD_MS + epsilon);
 
-        REQUIRE(numDemandSent(apps[2]) == 1);
-        REQUIRE(numUnknownDemand(apps[0]) == 1);
+        REQUIRE(overlaytestutils::getSentDemandCount(apps[2]) == 1);
+        REQUIRE(overlaytestutils::getUnknownDemandCount(apps[0]) == 1);
 
         // 10 seconds is long enough for a few timeouts to fire
         // but not long enough for the pending demand record to drop.
@@ -1994,8 +1975,8 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
         testutil::crankFor(
             clock, 3 * apps[2]->getConfig().FLOOD_DEMAND_PERIOD_MS + epsilon);
 
-        REQUIRE(numDemandSent(apps[2]) == 1);
-        REQUIRE(numUnknownDemand(apps[0]) == 1);
+        REQUIRE(overlaytestutils::getSentDemandCount(apps[2]) == 1);
+        REQUIRE(overlaytestutils::getUnknownDemandCount(apps[0]) == 1);
     }
 
     SECTION("do not advertise to peers that know about tx")
@@ -2020,9 +2001,11 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
             // Give enough time for Node2 to issue a demand and receive tx0
             testutil::crankFor(clock, std::chrono::seconds(1));
 
-            REQUIRE(numDemandSent(apps[2]) == 1);
+            REQUIRE(overlaytestutils::getSentDemandCount(apps[2]) == 1);
             // Either Node0 or Node1 fulfill the demand
-            auto fulfilled = numFulfilled(apps[0]) + numFulfilled(apps[1]);
+            auto fulfilled =
+                overlaytestutils::getFulfilledDemandCount(apps[0]) +
+                overlaytestutils::getFulfilledDemandCount(apps[1]);
             REQUIRE(fulfilled == 1);
             // After receiving a transaction, Node2 does not advertise it to
             // anyone because others already know about it
@@ -2034,50 +2017,7 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
                         ->getMetrics()
                         .NewTimer({"overlay", "recv", "transaction"})
                         .count() == 1);
-            REQUIRE(numTxHashesAdvertised(apps[2]) == 0);
-        }
-        SECTION("pull mode disabled on Node3")
-        {
-            // Add another node with pull mode disabled, so it will flood
-            // transactions directly
-            Config cfg = getTestConfig(3);
-            cfg.ENABLE_PULL_MODE = false;
-            apps.push_back(createTestApplication(clock, cfg));
-            connections.push_back(
-                std::make_shared<LoopbackPeerConnection>(*apps[2], *apps[3]));
-            connections.push_back(
-                std::make_shared<LoopbackPeerConnection>(*apps[0], *apps[3]));
-            connections.push_back(
-                std::make_shared<LoopbackPeerConnection>(*apps[1], *apps[3]));
-
-            testutil::crankFor(clock, std::chrono::seconds(5));
-
-            // Node0 and Node1 know about tx0 and will advertise it to Node2
-            // Node3 will flood the transaction directly
-            twoNodesRecvTx();
-            REQUIRE(apps[3]->getHerder().recvTransaction(tx, true) ==
-                    TransactionQueue::AddResult::ADD_STATUS_PENDING);
-
-            // Give enough time for Node2 to receive tx0 from Node3 and adverts
-            // from Node0 and Node1
-            testutil::crankFor(clock, std::chrono::seconds(1));
-
-            // No demands sent, no fulfilling occurs
-            REQUIRE(numDemandSent(apps[2]) == 0);
-            REQUIRE(numFulfilled(apps[0]) == 0);
-            REQUIRE(numFulfilled(apps[1]) == 0);
-            REQUIRE(numFulfilled(apps[3]) == 0);
-            // After receiving a transaction, Node2 does not advertise/broadcast
-            // it to anyone because others already know about it
-            REQUIRE(apps[2]
-                        ->getMetrics()
-                        .NewTimer({"overlay", "recv", "flood-advert"})
-                        .count() == 2);
-            REQUIRE(apps[2]
-                        ->getMetrics()
-                        .NewTimer({"overlay", "recv", "transaction"})
-                        .count() == 1);
-            REQUIRE(numTxHashesAdvertised(apps[2]) == 0);
+            REQUIRE(overlaytestutils::getAdvertisedHashCount(apps[2]) == 0);
         }
     }
 
@@ -2101,9 +2041,9 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
         testutil::crankFor(clock, apps[2]->getConfig().FLOOD_DEMAND_PERIOD_MS +
                                       epsilon);
 
-        REQUIRE(numDemandSent(apps[2]) == 2);
-        REQUIRE(numUnknownDemand(apps[0]) == 1);
-        REQUIRE(numUnknownDemand(apps[1]) == 1);
+        REQUIRE(overlaytestutils::getSentDemandCount(apps[2]) == 2);
+        REQUIRE(overlaytestutils::getUnknownDemandCount(apps[0]) == 1);
+        REQUIRE(overlaytestutils::getUnknownDemandCount(apps[1]) == 1);
     }
 
     SECTION("exact same advert from two peers")
@@ -2127,12 +2067,12 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
         testutil::crankFor(clock, apps[2]->getConfig().FLOOD_DEMAND_PERIOD_MS +
                                       epsilon);
 
-        REQUIRE(numDemandSent(apps[2]) == 2);
+        REQUIRE(overlaytestutils::getSentDemandCount(apps[2]) == 2);
         {
             // Node 2 is supposed to split the 5 demands evenly between Node 0
             // and Node 1 with no overlap.
-            auto n0 = numUnknownDemand(apps[0]);
-            auto n1 = numUnknownDemand(apps[1]);
+            auto n0 = overlaytestutils::getUnknownDemandCount(apps[0]);
+            auto n1 = overlaytestutils::getUnknownDemandCount(apps[1]);
             REQUIRE(std::min(n0, n1) == 2);
             REQUIRE(std::max(n0, n1) == 3);
             REQUIRE((n0 + n1) == 5);
@@ -2146,9 +2086,9 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
                        epsilon);
 
         // Now both nodes should have gotten demands for all the 5 txn hashes.
-        REQUIRE(numDemandSent(apps[2]) == 4);
-        REQUIRE(numUnknownDemand(apps[0]) == 5);
-        REQUIRE(numUnknownDemand(apps[1]) == 5);
+        REQUIRE(overlaytestutils::getSentDemandCount(apps[2]) == 4);
+        REQUIRE(overlaytestutils::getUnknownDemandCount(apps[0]) == 5);
+        REQUIRE(overlaytestutils::getUnknownDemandCount(apps[1]) == 5);
     }
 
     SECTION("overlapping adverts")
@@ -2173,13 +2113,13 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
         testutil::crankFor(clock, apps[2]->getConfig().FLOOD_DEMAND_PERIOD_MS +
                                       epsilon);
 
-        REQUIRE(numDemandSent(apps[2]) == 2);
+        REQUIRE(overlaytestutils::getSentDemandCount(apps[2]) == 2);
 
         {
             // Node 0 should get a demand for tx 1 and one of {tx 0, tx 3}.
             // Node 1 should get a demand for tx 2 and one of {tx 0, tx 3}.
-            REQUIRE(numUnknownDemand(apps[0]) == 2);
-            REQUIRE(numUnknownDemand(apps[1]) == 2);
+            REQUIRE(overlaytestutils::getUnknownDemandCount(apps[0]) == 2);
+            REQUIRE(overlaytestutils::getUnknownDemandCount(apps[1]) == 2);
         }
 
         // Wait long enough so the first round of demands expire and the second
@@ -2190,9 +2130,9 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
 
         // Node 0 should get a demand for the other member of {tx 0, tx 3}.
         // The same for Node 1.
-        REQUIRE(numDemandSent(apps[2]) == 4);
-        REQUIRE(numUnknownDemand(apps[0]) == 3);
-        REQUIRE(numUnknownDemand(apps[1]) == 3);
+        REQUIRE(overlaytestutils::getSentDemandCount(apps[2]) == 4);
+        REQUIRE(overlaytestutils::getUnknownDemandCount(apps[0]) == 3);
+        REQUIRE(overlaytestutils::getUnknownDemandCount(apps[1]) == 3);
     }
 
     SECTION("randomize peers")
@@ -2221,12 +2161,12 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
             testutil::crankFor(
                 clock, apps[2]->getConfig().FLOOD_DEMAND_PERIOD_MS + epsilon);
 
-            REQUIRE(numDemandSent(apps[2]) == i * 4 + 2);
+            REQUIRE(overlaytestutils::getSentDemandCount(apps[2]) == i * 4 + 2);
             {
                 // Node 2 should split the 5 txn hashes
                 // evenly among Node 0 and Node 1.
-                auto n0 = numUnknownDemand(apps[0]);
-                auto n1 = numUnknownDemand(apps[1]);
+                auto n0 = overlaytestutils::getUnknownDemandCount(apps[0]);
+                auto n1 = overlaytestutils::getUnknownDemandCount(apps[1]);
                 REQUIRE(std::max(n0, n1) == i * numTxns + 3);
                 REQUIRE(std::min(n0, n1) == i * numTxns + 2);
                 if (n0 < n1)
@@ -2244,8 +2184,10 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
             testutil::crankFor(
                 clock,
                 apps[2]->getConfig().FLOOD_DEMAND_BACKOFF_DELAY_MS + epsilon);
-            REQUIRE(numUnknownDemand(apps[0]) == (i + 1) * numTxns);
-            REQUIRE(numUnknownDemand(apps[1]) == (i + 1) * numTxns);
+            REQUIRE(overlaytestutils::getUnknownDemandCount(apps[0]) ==
+                    (i + 1) * numTxns);
+            REQUIRE(overlaytestutils::getUnknownDemandCount(apps[1]) ==
+                    (i + 1) * numTxns);
         }
 
         // In each of the 300 rounds, both peer0 and peer1 have
@@ -2258,62 +2200,6 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
     for (auto& app : apps)
     {
         testutil::shutdownWorkScheduler(*app);
-    }
-}
-
-TEST_CASE("pull mode enable only if both request", "[overlay][pullmode]")
-{
-    VirtualClock clock;
-    auto test = [&](auto node1, auto node2) {
-        Config cfg1 = getTestConfig(1);
-        cfg1.ENABLE_PULL_MODE = node1;
-        auto app1 = createTestApplication(clock, cfg1);
-        Config cfg2 = getTestConfig(2);
-        cfg2.ENABLE_PULL_MODE = node2;
-        auto app2 = createTestApplication(clock, cfg2);
-
-        auto conn = std::make_shared<LoopbackPeerConnection>(*app1, *app2);
-        testutil::crankSome(clock);
-
-        REQUIRE(conn->getInitiator()->isAuthenticated());
-        REQUIRE(conn->getAcceptor()->isAuthenticated());
-        REQUIRE(conn->getInitiator()->isPullModeEnabled() == false);
-        REQUIRE(conn->getAcceptor()->isPullModeEnabled() == false);
-
-        SECTION("peer does not follow the protocol")
-        {
-            StellarMessage adv, emptyMsg;
-            adv.type(FLOOD_ADVERT);
-            adv.floodAdvert().txHashes.push_back(xdrSha256(emptyMsg));
-            conn->getInitiator()->sendMessage(
-                std::make_shared<StellarMessage>(adv));
-            testutil::crankSome(clock);
-
-            if (node1 && node2)
-            {
-                REQUIRE(conn->getInitiator()->isAuthenticated());
-                REQUIRE(conn->getAcceptor()->isAuthenticated());
-            }
-            else
-            {
-                REQUIRE(!conn->getInitiator()->isConnected());
-                REQUIRE(!conn->getAcceptor()->isConnected());
-                REQUIRE(conn->getAcceptor()->getDropReason() ==
-                        "Peer sent FLOOD_ADVERT, but pull mode is disabled");
-            }
-        }
-    };
-    SECTION("acceptor disabled pull mode")
-    {
-        test(true, false);
-    }
-    SECTION("initiator disabled pull mode")
-    {
-        test(false, true);
-    }
-    SECTION("both disabled pull mode")
-    {
-        test(false, false);
     }
 }
 
@@ -2336,8 +2222,6 @@ TEST_CASE("overlay pull mode loadgen", "[overlay][pullmode][acceptance]")
     for (auto i = 0; i < 2; i++)
     {
         auto cfg = getTestConfig(i + 1);
-
-        cfg.ENABLE_PULL_MODE = true;
         configs.push_back(cfg);
     }
 
@@ -2372,12 +2256,12 @@ TEST_CASE("overlay pull mode loadgen", "[overlay][pullmode][acceptance]")
         10 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
 
     // Node 1 advertised 5 txn hashes to each of Node 2 and Node 3.
-    REQUIRE(numTxHashesAdvertised(node1) == numAccounts);
-    REQUIRE(numTxHashesAdvertised(node2) == 0);
+    REQUIRE(overlaytestutils::getAdvertisedHashCount(node1) == numAccounts);
+    REQUIRE(overlaytestutils::getAdvertisedHashCount(node2) == 0);
 
     // As this is a "happy path", there should be no unknown demands.
-    REQUIRE(numUnknownDemand(node1) == 0);
-    REQUIRE(numUnknownDemand(node2) == 0);
+    REQUIRE(overlaytestutils::getUnknownDemandCount(node1) == 0);
+    REQUIRE(overlaytestutils::getUnknownDemandCount(node2) == 0);
 }
 
 TEST_CASE("overlay pull mode with many peers",
@@ -2394,7 +2278,6 @@ TEST_CASE("overlay pull mode with many peers",
     for (auto i = 0; i < numNodes; i++)
     {
         Config cfg = getTestConfig(i);
-        cfg.ENABLE_PULL_MODE = true;
         apps.push_back(createTestApplication(clock, cfg));
     }
 
@@ -2411,10 +2294,6 @@ TEST_CASE("overlay pull mode with many peers",
     {
         REQUIRE(conn->getInitiator()->isAuthenticated());
         REQUIRE(conn->getAcceptor()->isAuthenticated());
-        REQUIRE(conn->getInitiator()->flowControlEnabled() ==
-                Peer::FlowControlState::ENABLED);
-        REQUIRE(conn->getAcceptor()->flowControlEnabled() ==
-                Peer::FlowControlState::ENABLED);
     }
 
     StellarMessage adv, emptyMsg;
@@ -2434,6 +2313,6 @@ TEST_CASE("overlay pull mode with many peers",
     // it's likely that they'll happen in 10 minutes.
     testutil::crankFor(clock, std::chrono::minutes(10));
 
-    REQUIRE(numDemandSent(apps[0]) == maxRetry);
+    REQUIRE(overlaytestutils::getSentDemandCount(apps[0]) == maxRetry);
 }
 }

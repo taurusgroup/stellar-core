@@ -169,25 +169,28 @@ struct BucketListGenerator
             auto& level = blGenerate.getLevel(i);
             auto meta = testutil::testBucketMetadata(vers);
             auto keepDead = BucketList::keepDeadEntries(i);
-            {
+
+            auto writeBucketFile = [&](auto b) {
                 BucketOutputIterator out(bmApply.getTmpDir(), keepDead, meta,
                                          mergeCounters, mClock.getIOContext(),
                                          /*doFsync=*/true);
-                for (BucketInputIterator in(level.getCurr()); in; ++in)
+                for (BucketInputIterator in(b); in; ++in)
                 {
                     out.put(*in);
                 }
-                auto b = out.getBucket(bmApply);
-            }
+
+                auto bucket =
+                    out.getBucket(bmApply, /*shouldSynchronouslyIndex=*/false);
+            };
+            writeBucketFile(level.getCurr());
+            writeBucketFile(level.getSnap());
+
+            auto& next = level.getNext();
+            if (next.hasOutputHash())
             {
-                BucketOutputIterator out(bmApply.getTmpDir(), keepDead, meta,
-                                         mergeCounters, mClock.getIOContext(),
-                                         /*doFsync=*/true);
-                for (BucketInputIterator in(level.getSnap()); in; ++in)
-                {
-                    out.put(*in);
-                }
-                auto b = out.getBucket(bmApply);
+                auto nextBucket = next.resolve();
+                REQUIRE(nextBucket);
+                writeBucketFile(nextBucket);
             }
         }
         return HistoryArchiveState(
@@ -299,7 +302,7 @@ class ApplyBucketsWorkAddEntry : public ApplyBucketsWork
     }
 
     BasicWork::State
-    onRun() override
+    doWork() override
     {
         if (!mAdded)
         {
@@ -323,7 +326,7 @@ class ApplyBucketsWorkAddEntry : public ApplyBucketsWork
                 mAdded = true;
             }
         }
-        auto r = ApplyBucketsWork::onRun();
+        auto r = ApplyBucketsWork::doWork();
         if (r == State::WORK_SUCCESS)
         {
             REQUIRE(mAdded);
@@ -353,7 +356,7 @@ class ApplyBucketsWorkDeleteEntry : public ApplyBucketsWork
     }
 
     BasicWork::State
-    onRun() override
+    doWork() override
     {
         if (!mDeleted)
         {
@@ -366,7 +369,7 @@ class ApplyBucketsWorkDeleteEntry : public ApplyBucketsWork
                 mDeleted = true;
             }
         }
-        auto r = ApplyBucketsWork::onRun();
+        auto r = ApplyBucketsWork::doWork();
         if (r == State::WORK_SUCCESS)
         {
             REQUIRE(mDeleted);
@@ -471,6 +474,17 @@ class ApplyBucketsWorkModifyEntry : public ApplyBucketsWork
         entry.data.contractData().key = cd.key;
     }
 
+    void
+    modifyContractCodeEntry(LedgerEntry& entry)
+    {
+        ContractCodeEntry const& cc = mEntry.data.contractCode();
+        entry.lastModifiedLedgerSeq = mEntry.lastModifiedLedgerSeq;
+        entry.data.contractCode() =
+            LedgerTestUtils::generateValidContractCodeEntry(5);
+
+        entry.data.contractCode().hash = cc.hash;
+    }
+
 #endif
 
   public:
@@ -487,7 +501,7 @@ class ApplyBucketsWorkModifyEntry : public ApplyBucketsWork
     }
 
     BasicWork::State
-    onRun() override
+    doWork() override
     {
         if (!mModified)
         {
@@ -522,6 +536,9 @@ class ApplyBucketsWorkModifyEntry : public ApplyBucketsWork
                 case CONTRACT_DATA:
                     modifyContractDataEntry(entry.current());
                     break;
+                case CONTRACT_CODE:
+                    modifyContractCodeEntry(entry.current());
+                    break;
 #endif
                 default:
                     REQUIRE(false);
@@ -530,7 +547,7 @@ class ApplyBucketsWorkModifyEntry : public ApplyBucketsWork
                 mModified = true;
             }
         }
-        auto r = ApplyBucketsWork::onRun();
+        auto r = ApplyBucketsWork::doWork();
         if (r == State::WORK_SUCCESS)
         {
             REQUIRE(mModified);

@@ -104,6 +104,14 @@ class LoopbackPeer : public Peer
     double getReorderProbability() const;
     void setReorderProbability(double d);
 
+#ifdef BUILD_TESTS
+    void
+    overrideDisablePullModeForTesting()
+    {
+        mOverrideDisablePullModeForTesting = true;
+    }
+#endif
+
     void clearInAndOutQueues();
 
     std::string
@@ -129,7 +137,6 @@ class LoopbackPeer : public Peer
     std::string getIP() const override;
 
     using Peer::addMsgAndMaybeTrimQueue;
-    using Peer::flowControlEnabled;
     using Peer::sendAuth;
     using Peer::sendAuthenticatedMessage;
     using Peer::sendMessage;

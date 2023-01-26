@@ -14,6 +14,7 @@
 #include "overlay/OverlayMetrics.h"
 #include "overlay/PeerDoor.h"
 #include "overlay/TCPPeer.h"
+#include "overlay/test/OverlayTestUtils.h"
 #include "simulation/Simulation.h"
 #include "simulation/Topologies.h"
 #include "test/TestAccount.h"
@@ -212,7 +213,6 @@ TEST_CASE("Flooding", "[flood][overlay][acceptance]")
                 // While there's no strict requirement for batching,
                 // it seems more useful to test more realistic settings.
                 cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 1000;
-                cfg.ENABLE_PULL_MODE = true;
                 return cfg;
             };
             SECTION("pull mode with 2 nodes")
@@ -236,26 +236,11 @@ TEST_CASE("Flooding", "[flood][overlay][acceptance]")
                     auto advertsRecvd = om.mRecvFloodAdvertTimer.count();
                     auto demandsSent = om.mSendFloodDemandMeter.count();
                     auto hashesQueued =
-                        app->getMetrics()
-                            .NewMeter({"overlay", "flood", "advertised"},
-                                      "message")
-                            .count();
+                        overlaytestutils::getAdvertisedHashCount(app);
                     auto demandFulfilled =
-                        app->getMetrics()
-                            .NewMeter({"overlay", "flood", "fulfilled"},
-                                      "message")
-                            .count();
+                        overlaytestutils::getFulfilledDemandCount(app);
                     auto messagesUnfulfilled =
-                        app->getMetrics()
-                            .NewMeter(
-                                {"overlay", "flood", "unfulfilled-unknown"},
-                                "message")
-                            .count() +
-                        app->getMetrics()
-                            .NewMeter(
-                                {"overlay", "flood", "unfulfilled-banned"},
-                                "message")
-                            .count();
+                        overlaytestutils::getUnfulfilledDemandCount(app);
 
                     LOG_DEBUG(
                         DEFAULT_LOG,
@@ -284,21 +269,15 @@ TEST_CASE("Flooding", "[flood][overlay][acceptance]")
 
                 SECTION("advertise same transaction after some time")
                 {
-                    auto nodes = simulation->getNodes();
-                    auto hashesAdvertised = [&](Application::pointer app) {
-                        return app->getMetrics()
-                            .NewMeter({"overlay", "flood", "advertised"},
-                                      "message")
-                            .count();
-                    };
-
                     for (auto const& node : nodes)
                     {
-                        auto before = hashesAdvertised(node);
+                        auto before =
+                            overlaytestutils::getAdvertisedHashCount(node);
                         node->getOverlayManager().broadcastMessage(
                             testTransaction->toStellarMessage(), false,
                             testTransaction->getFullHash());
-                        REQUIRE(before == hashesAdvertised(node));
+                        REQUIRE(before ==
+                                overlaytestutils::getAdvertisedHashCount(node));
                     }
 
                     // Now crank for some time and trigger cleanups
@@ -316,12 +295,14 @@ TEST_CASE("Flooding", "[flood][overlay][acceptance]")
                     // Ensure old transaction gets re-broadcasted
                     for (auto const& node : nodes)
                     {
-                        auto before = hashesAdvertised(node);
+                        auto before =
+                            overlaytestutils::getAdvertisedHashCount(node);
                         node->getOverlayManager().broadcastMessage(
                             testTransaction->toStellarMessage(), false,
                             testTransaction->getFullHash());
 
-                        REQUIRE(before + 1 == hashesAdvertised(node));
+                        REQUIRE(before + 1 ==
+                                overlaytestutils::getAdvertisedHashCount(node));
                     }
                 }
             }
@@ -344,26 +325,11 @@ TEST_CASE("Flooding", "[flood][overlay][acceptance]")
                     auto advertsRecvd = om.mRecvFloodAdvertTimer.count();
                     auto demandsSent = om.mSendFloodDemandMeter.count();
                     auto hashesQueued =
-                        app->getMetrics()
-                            .NewMeter({"overlay", "flood", "advertised"},
-                                      "message")
-                            .count();
+                        overlaytestutils::getAdvertisedHashCount(app);
                     auto demandFulfilled =
-                        app->getMetrics()
-                            .NewMeter({"overlay", "flood", "fulfilled"},
-                                      "message")
-                            .count();
+                        overlaytestutils::getFulfilledDemandCount(app);
                     auto messagesUnfulfilled =
-                        app->getMetrics()
-                            .NewMeter(
-                                {"overlay", "flood", "unfulfilled-unknown"},
-                                "message")
-                            .count() +
-                        app->getMetrics()
-                            .NewMeter(
-                                {"overlay", "flood", "unfulfilled-banned"},
-                                "message")
-                            .count();
+                        overlaytestutils::getUnfulfilledDemandCount(app);
 
                     LOG_DEBUG(
                         DEFAULT_LOG,

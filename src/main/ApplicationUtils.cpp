@@ -666,13 +666,13 @@ initializeDatabase(Config cfg)
 }
 
 void
-showOfflineInfo(Config cfg)
+showOfflineInfo(Config cfg, bool verbose)
 {
     // needs real time to display proper stats
     VirtualClock clock(VirtualClock::REAL_TIME);
     cfg.setNoListen();
     Application::pointer app = Application::create(clock, cfg, false);
-    app->reportInfo();
+    app->reportInfo(verbose);
 }
 
 #ifdef BUILD_TESTS
@@ -684,7 +684,7 @@ loadXdr(Config cfg, std::string const& bucketFile)
     Application::pointer app = Application::create(clock, cfg, false);
 
     uint256 zero;
-    Bucket bucket(bucketFile, zero);
+    Bucket bucket(bucketFile, zero, nullptr);
     bucket.apply(*app);
 }
 
@@ -868,7 +868,7 @@ catchup(Application::pointer app, CatchupConfiguration cc,
     }
     LOG_INFO(DEFAULT_LOG, "*");
 
-    catchupInfo = app->getJsonInfo();
+    catchupInfo = app->getJsonInfo(true);
     return synced ? 0 : 3;
 }
 

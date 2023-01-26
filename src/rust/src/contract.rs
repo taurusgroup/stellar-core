@@ -16,14 +16,14 @@ use std::{cell::RefCell, fmt::Display, io::Cursor, panic, pin::Pin, rc::Rc};
 use soroban_env_host::{
     budget::Budget,
     events::{DebugError, DebugEvent, Events, HostEvent},
-    storage::{self, AccessType, SnapshotSource, Storage},
+    storage::{self, AccessType, Footprint, FootprintMap, SnapshotSource, Storage, StorageMap},
     xdr,
     xdr::{
         AccountId, HostFunction, LedgerEntry, LedgerEntryData, LedgerFootprint, LedgerKey,
-        LedgerKeyAccount, LedgerKeyContractData, LedgerKeyTrustLine, ReadXdr,
-        ScHostContextErrorCode, ScUnknownErrorCode, ScVec, WriteXdr, XDR_FILES_SHA256,
+        LedgerKeyAccount, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTrustLine,
+        ReadXdr, ScHostContextErrorCode, ScUnknownErrorCode, WriteXdr, XDR_FILES_SHA256,
     },
-    Host, HostError, LedgerInfo, MeteredOrdMap,
+    Host, HostError, LedgerInfo,
 };
 use std::error::Error;
 
@@ -103,16 +103,20 @@ pub fn get_xdr_hashes() -> Vec<XDRFileHash> {
 /// [`AccessType`] `ty` into a [`storage::Footprint`] for every [`LedgerKey`] in
 /// `keys`.
 fn populate_access_map(
-    access: &mut MeteredOrdMap<Box<LedgerKey>, AccessType>,
+    access: &mut FootprintMap,
     keys: Vec<LedgerKey>,
     ty: AccessType,
+    budget: &Budget,
 ) -> Result<(), CoreHostError> {
     for lk in keys {
         match lk {
-            LedgerKey::Account(_) | LedgerKey::Trustline(_) | LedgerKey::ContractData(_) => (),
+            LedgerKey::Account(_)
+            | LedgerKey::Trustline(_)
+            | LedgerKey::ContractData(_)
+            | LedgerKey::ContractCode(_) => (),
             _ => return Err(CoreHostError::General("unexpected ledger entry type")),
         };
-        access.insert(Box::new(lk), ty.clone())?;
+        *access = access.insert(Rc::new(lk), ty.clone(), budget)?;
     }
     Ok(())
 }
@@ -121,17 +125,27 @@ fn populate_access_map(
 /// its entries to an [`OrdMap`], and returns a [`storage::Footprint`]
 /// containing that map.
 fn build_storage_footprint_from_xdr(
-    budget: Budget,
+    budget: &Budget,
     footprint: &CxxBuf,
-) -> Result<storage::Footprint, CoreHostError> {
+) -> Result<Footprint, CoreHostError> {
     let xdr::LedgerFootprint {
         read_only,
         read_write,
     } = xdr::LedgerFootprint::read_xdr(&mut Cursor::new(footprint.data.as_slice()))?;
-    let mut access = MeteredOrdMap::new(budget)?;
+    let mut access = FootprintMap::new(budget)?;
 
-    populate_access_map(&mut access, read_only.to_vec(), AccessType::ReadOnly)?;
-    populate_access_map(&mut access, read_write.to_vec(), AccessType::ReadWrite)?;
+    populate_access_map(
+        &mut access,
+        read_only.to_vec(),
+        AccessType::ReadOnly,
+        budget,
+    )?;
+    populate_access_map(
+        &mut access,
+        read_write.to_vec(),
+        AccessType::ReadWrite,
+        budget,
+    )?;
     Ok(storage::Footprint(access))
 }
 
@@ -148,6 +162,9 @@ fn ledger_entry_to_ledger_key(le: &LedgerEntry) -> Result<LedgerKey, CoreHostErr
             contract_id: cd.contract_id.clone(),
             key: cd.key.clone(),
         })),
+        LedgerEntryData::ContractCode(code) => Ok(LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: code.hash.clone(),
+        })),
         _ => Err(CoreHostError::General("unexpected ledger key")),
     }
 }
@@ -157,24 +174,24 @@ fn ledger_entry_to_ledger_key(le: &LedgerEntry) -> Result<LedgerKey, CoreHostErr
 /// additionally keyed by the provided contract ID, checks that the entries
 /// match the provided [`storage::Footprint`], and returns the constructed map.
 fn build_storage_map_from_xdr_ledger_entries(
-    budget: Budget,
+    budget: &Budget,
     footprint: &storage::Footprint,
     ledger_entries: &Vec<CxxBuf>,
-) -> Result<MeteredOrdMap<Box<LedgerKey>, Option<Box<LedgerEntry>>>, CoreHostError> {
-    let mut map = MeteredOrdMap::new(budget)?;
+) -> Result<StorageMap, CoreHostError> {
+    let mut map = StorageMap::new(budget)?;
     for buf in ledger_entries {
-        let le = xdr_from_cxx_buf::<LedgerEntry>(buf)?;
-        let key = ledger_entry_to_ledger_key(&le)?;
-        if !footprint.0.contains_key(&key)? {
+        let le = Rc::new(xdr_from_cxx_buf::<LedgerEntry>(buf)?);
+        let key = Rc::new(ledger_entry_to_ledger_key(&le)?);
+        if !footprint.0.contains_key::<LedgerKey>(&key, budget)? {
             return Err(CoreHostError::General(
                 "ledger entry not found in footprint",
             ));
         }
-        map.insert(Box::new(key), Some(Box::new(le)))?;
+        map = map.insert(key, Some(le), budget)?;
     }
-    for k in footprint.0.keys()? {
-        if !map.contains_key(k)? {
-            map.insert(Box::new(*k.clone()), None)?;
+    for k in footprint.0.keys(budget)? {
+        if !map.contains_key::<LedgerKey>(k, budget)? {
+            map = map.insert(k.clone(), None, budget)?;
         }
     }
     Ok(map)
@@ -184,15 +201,16 @@ fn build_storage_map_from_xdr_ledger_entries(
 /// back to XDR.
 fn build_xdr_ledger_entries_from_storage_map(
     footprint: &storage::Footprint,
-    storage_map: &MeteredOrdMap<Box<LedgerKey>, Option<Box<LedgerEntry>>>,
+    storage_map: &StorageMap,
+    budget: &Budget,
 ) -> Result<Vec<RustBuf>, CoreHostError> {
     let mut res = Vec::new();
     for (lk, ole) in storage_map {
-        match footprint.0.get(lk)? {
+        match footprint.0.get::<LedgerKey>(lk, budget)? {
             Some(AccessType::ReadOnly) => (),
             Some(AccessType::ReadWrite) => {
                 if let Some(le) = ole {
-                    res.push(xdr_to_rust_buf(le)?)
+                    res.push(xdr_to_rust_buf(&**le)?)
                 }
             }
             None => return Err(CoreHostError::General("ledger entry not in footprint")),
@@ -221,15 +239,14 @@ fn log_debug_events(events: &Events) {
     }
 }
 
-/// Deserializes an [`xdr::HostFunction`] host function identifier, an [`xdr::ScVec`] XDR object of
-/// arguments, an [`xdr::Footprint`] and a sequence of [`xdr::LedgerEntry`] entries containing all
-/// the data the invocation intends to read. Then calls the host function with the specified
-/// arguments, discards the [`xdr::ScVal`] return value, and returns the [`ReadWrite`] ledger
-/// entries in serialized form. Ledger entries not returned have been deleted.
-
+/// Deserializes an [`xdr::HostFunction`] host function XDR object an
+/// [`xdr::Footprint`] and a sequence of [`xdr::LedgerEntry`] entries containing all
+/// the data the invocation intends to read. Then calls the specified host function
+/// and returns the [`InvokeHostFunctionOutput`] that contains the host function
+/// result, events and modified ledger entries. Ledger entries not returned have
+/// been deleted.
 pub(crate) fn invoke_host_function(
     hf_buf: &CxxBuf,
-    args_buf: &CxxBuf,
     footprint_buf: &CxxBuf,
     source_account_buf: &CxxBuf,
     ledger_info: CxxLedgerInfo,
@@ -238,7 +255,6 @@ pub(crate) fn invoke_host_function(
     let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         invoke_host_function_or_maybe_panic(
             hf_buf,
-            args_buf,
             footprint_buf,
             source_account_buf,
             ledger_info,
@@ -253,7 +269,6 @@ pub(crate) fn invoke_host_function(
 
 fn invoke_host_function_or_maybe_panic(
     hf_buf: &CxxBuf,
-    args_buf: &CxxBuf,
     footprint_buf: &CxxBuf,
     source_account_buf: &CxxBuf,
     ledger_info: CxxLedgerInfo,
@@ -261,13 +276,10 @@ fn invoke_host_function_or_maybe_panic(
 ) -> Result<InvokeHostFunctionOutput, Box<dyn Error>> {
     let budget = Budget::default();
     let hf = xdr_from_cxx_buf::<HostFunction>(&hf_buf)?;
-    let args = xdr_from_cxx_buf::<ScVec>(&args_buf)?;
     let source_account = xdr_from_cxx_buf::<AccountId>(&source_account_buf)?;
 
-    let footprint = build_storage_footprint_from_xdr(budget.clone(), footprint_buf)?;
-    let map =
-        build_storage_map_from_xdr_ledger_entries(budget.clone(), &footprint, ledger_entries)?;
-
+    let footprint = build_storage_footprint_from_xdr(&budget, footprint_buf)?;
+    let map = build_storage_map_from_xdr_ledger_entries(&budget, &footprint, ledger_entries)?;
     let storage = Storage::with_enforcing_footprint_and_map(footprint, map);
     let host = Host::with_storage_and_budget(storage, budget);
     host.set_source_account(source_account);
@@ -278,7 +290,7 @@ fn invoke_host_function_or_maybe_panic(
         "invoking host function '{}'",
         HostFunction::name(&hf)
     );
-    let res = host.invoke_function(hf, args);
+    let res = host.invoke_function(hf);
     let (storage, budget, events) = host
         .try_finish()
         .map_err(|_h| CoreHostError::General("could not finalize host"))?;
@@ -291,7 +303,7 @@ fn invoke_host_function_or_maybe_panic(
         }
     };
     let modified_ledger_entries =
-        build_xdr_ledger_entries_from_storage_map(&storage.footprint, &storage.map)?;
+        build_xdr_ledger_entries_from_storage_map(&storage.footprint, &storage.map, &budget)?;
     let contract_events = extract_contract_events(&events)?;
     Ok(InvokeHostFunctionOutput {
         result_value,
@@ -369,17 +381,19 @@ impl SnapshotSource for Pfc {
 
 fn storage_footprint_to_ledger_footprint(
     foot: &storage::Footprint,
-) -> Result<LedgerFootprint, xdr::Error> {
+    budget: &Budget,
+) -> Result<LedgerFootprint, Box<dyn Error>> {
     let mut read_only = Vec::new();
     let mut read_write = Vec::new();
-    for (k, v) in foot.0.iter() {
+    for (k, v) in foot.0.iter(budget)? {
         match v {
             AccessType::ReadOnly => read_only.push(k.clone()),
             AccessType::ReadWrite => read_write.push(k.clone()),
         }
     }
-    let read_only_not_boxed: Vec<LedgerKey> = read_only.into_iter().map(|x| *x).collect();
-    let read_write_not_boxed: Vec<LedgerKey> = read_write.into_iter().map(|x| *x).collect();
+    let read_only_not_boxed: Vec<LedgerKey> = read_only.into_iter().map(|x| (*x).clone()).collect();
+    let read_write_not_boxed: Vec<LedgerKey> =
+        read_write.into_iter().map(|x| (*x).clone()).collect();
     Ok(LedgerFootprint {
         read_only: read_only_not_boxed.try_into()?,
         read_write: read_write_not_boxed.try_into()?,
@@ -388,19 +402,12 @@ fn storage_footprint_to_ledger_footprint(
 
 pub(crate) fn preflight_host_function(
     hf_buf: &CxxVector<u8>,
-    args_buf: &CxxVector<u8>,
     source_account_buf: &CxxVector<u8>,
     ledger_info: CxxLedgerInfo,
     cb: UniquePtr<PreflightCallbacks>,
 ) -> Result<PreflightHostFunctionOutput, Box<dyn Error>> {
     let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        preflight_host_function_or_maybe_panic(
-            hf_buf,
-            args_buf,
-            source_account_buf,
-            ledger_info,
-            cb,
-        )
+        preflight_host_function_or_maybe_panic(hf_buf, source_account_buf, ledger_info, cb)
     }));
     match res {
         Err(_) => Err(CoreHostError::General("contract host panicked").into()),
@@ -410,13 +417,11 @@ pub(crate) fn preflight_host_function(
 
 fn preflight_host_function_or_maybe_panic(
     hf_buf: &CxxVector<u8>,
-    args_buf: &CxxVector<u8>,
     source_account_buf: &CxxVector<u8>,
     ledger_info: CxxLedgerInfo,
     cb: UniquePtr<PreflightCallbacks>,
 ) -> Result<PreflightHostFunctionOutput, Box<dyn Error>> {
     let hf = xdr_from_slice::<HostFunction>(hf_buf.as_slice())?;
-    let args = xdr_from_slice::<ScVec>(args_buf.as_slice())?;
     let source_account = xdr_from_slice::<AccountId>(source_account_buf.as_slice())?;
     let pfc = Rc::new(Pfc(RefCell::new(None), RefCell::new(cb)));
     let src: Rc<dyn SnapshotSource> = pfc.clone() as Rc<dyn SnapshotSource>;
@@ -439,7 +444,7 @@ fn preflight_host_function_or_maybe_panic(
     *pfc.0.try_borrow_mut()? = Some(host.clone());
 
     // Run the preflight.
-    let res = host.invoke_function(hf, args);
+    let res = host.invoke_function(hf);
 
     // Break cyclical ownership between Pfc and Host.
     *pfc.0.try_borrow_mut()? = None;
@@ -457,8 +462,10 @@ fn preflight_host_function_or_maybe_panic(
         }
     };
 
-    let storage_footprint =
-        xdr_to_rust_buf(&storage_footprint_to_ledger_footprint(&storage.footprint)?)?;
+    let storage_footprint = xdr_to_rust_buf(&storage_footprint_to_ledger_footprint(
+        &storage.footprint,
+        &budget,
+    )?)?;
     let contract_events = extract_contract_events(&events)?;
     let result_value = xdr_to_rust_buf(&val)?;
 
